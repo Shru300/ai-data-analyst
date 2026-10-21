@@ -1,18 +1,41 @@
-"""Turn a plain-English question into pandas code using an LLM, then run it safely."""
+"""Turn a plain-English question into pandas code using a FREE LLM, then run it safely.
+
+Supported providers (all free to start, pick one in your .env file):
+  - groq    : free API key, no credit card, very fast  (recommended)
+  - gemini  : free API key from Google AI Studio
+  - ollama  : runs fully on your own computer, no internet or key needed
+
+All three speak the OpenAI-compatible API, so one small client covers them.
+"""
 
 import os
 import re
 
-import anthropic
+import openai
 import pandas as pd
 from dotenv import load_dotenv
 
 from modules.sandbox import run_code
 
-load_dotenv()
+load_dotenv(override=True)
 
-# Change the model in your .env file with ANTHROPIC_MODEL=... if you want
-MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5-5")
+PROVIDERS = {
+    "groq": {
+        "base_url": "https://api.groq.com/openai/v1",
+        "key_env": "GROQ_API_KEY",
+        "model": "llama-3.3-70b-versatile",
+    },
+    "gemini": {
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+        "key_env": "GEMINI_API_KEY",
+        "model": "gemini-2.5-flash",
+    },
+    "ollama": {
+        "base_url": "http://localhost:11434/v1",
+        "key_env": None,
+        "model": "qwen2.5-coder:7b",
+    },
+}
 
 SYSTEM_PROMPT = """You are a data analyst who writes pandas code.
 
@@ -29,12 +52,25 @@ string explaining why.
 - Return ONLY Python code in a single ```python code block. No explanations."""
 
 
-def _client() -> anthropic.Anthropic:
-    if not os.getenv("ANTHROPIC_API_KEY"):
-        raise RuntimeError(
-            "ANTHROPIC_API_KEY not found. Add it to a .env file in the project folder."
-        )
-    return anthropic.Anthropic()
+def _settings() -> dict:
+    name = os.getenv("LLM_PROVIDER", "groq").lower()
+    if name not in PROVIDERS:
+        raise RuntimeError(f"Unknown LLM_PROVIDER '{name}'. Use: {', '.join(PROVIDERS)}.")
+    cfg = dict(PROVIDERS[name])
+    cfg["name"] = name
+    cfg["model"] = os.getenv("LLM_MODEL", cfg["model"])
+    return cfg
+
+
+def _client(cfg: dict) -> openai.OpenAI:
+    key = "ollama"  # Ollama ignores the key but the client needs something
+    if cfg["key_env"]:
+        key = os.getenv(cfg["key_env"])
+        if not key:
+            raise RuntimeError(
+                f"{cfg['key_env']} not found. Add it to the .env file in the project folder."
+            )
+    return openai.OpenAI(base_url=cfg["base_url"], api_key=key)
 
 
 def build_prompt(df: pd.DataFrame, question: str) -> str:
@@ -54,7 +90,11 @@ def extract_code(text: str) -> str:
 
 
 def generate_code(df, question, previous_code=None, error=None) -> str:
-    messages = [{"role": "user", "content": build_prompt(df, question)}]
+    cfg = _settings()
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": build_prompt(df, question)},
+    ]
 
     # Self-correction: show the model its own failed code and the error
     if previous_code and error:
@@ -67,14 +107,29 @@ def generate_code(df, question, previous_code=None, error=None) -> str:
             }
         )
 
-    response = _client().messages.create(
-        model=MODEL,
-        max_tokens=1000,
-        system=SYSTEM_PROMPT,
-        messages=messages,
-    )
-    text = "".join(block.text for block in response.content if block.type == "text")
-    return extract_code(text)
+    try:
+        response = _client(cfg).chat.completions.create(
+            model=cfg["model"],
+            messages=messages,
+            max_tokens=1000,
+            temperature=0,
+        )
+    except openai.AuthenticationError:
+        raise RuntimeError(f"Your {cfg['name']} API key was rejected. Check the key in .env.")
+    except openai.RateLimitError:
+        raise RuntimeError("Free-tier rate limit reached. Wait a minute and try again.")
+    except openai.NotFoundError:
+        raise RuntimeError(
+            f"Model '{cfg['model']}' was not found on {cfg['name']}. "
+            "Set LLM_MODEL in .env to a model your account can use."
+        )
+    except openai.APIConnectionError:
+        raise RuntimeError(
+            f"Could not connect to {cfg['name']}. "
+            + ("Is Ollama running?" if cfg["name"] == "ollama" else "Check your internet.")
+        )
+
+    return extract_code(response.choices[0].message.content or "")
 
 
 def ask(df: pd.DataFrame, question: str, max_retries: int = 1) -> dict:
